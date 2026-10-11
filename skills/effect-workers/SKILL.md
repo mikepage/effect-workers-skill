@@ -68,6 +68,11 @@ request waits on.
   in global scope, not in the first request. Effect falls back to microtasks
   for the timers Workers disallow in global scope, and a build with no I/O
   completes there, so no request owns it.
+- When the build needs the request's `env` or does I/O, never share a build
+  in progress (`routerPromise ??= build(env)`, a lazily built
+  `ManagedRuntime`). Let each request that finds nothing built build its
+  own, and keep the first that has finished and answered. flareosaur's
+  `Worker.make` does this.
 - The layer passed to `toWebHandler` is shared by every request on the
   isolate. Services in it hold configuration and functions, not request
   state or pending work.
@@ -99,12 +104,38 @@ the reply. That is the wrong shape in a Worker's fetch handler: the loop is
 driven by whichever request comes along and hangs as above. A warm-up
 request hides it but doesn't fix it. Instead:
 
-- put the server in a Durable Object, which outlives requests, or
-- write a request-scoped JSON-RPC handler for the stateless methods
-  (`tools/list`, `tools/call` on MCP 2026-07-28) that runs each call in the
-  request's fiber (Effect-TS/effect#9026 asks for this mode), or
+- build the server per request: only the stateless revision
+  (`McpProtocol.v2026_07_28`, no session kept in an isolate's memory), with
+  `HttpRouter.toWebHandler(Server)` acquired at the start of the request and
+  its `dispose` released at the end, so its fiber lives and dies inside that
+  request. Buffer the answer. Example:
+  https://github.com/mikepage/flareosaur/blob/main/examples/mcp-server.ts
+- put the server in a Durable Object, which outlives requests; needed for
+  server-to-client features (sampling, elicitation) and subscriptions, or
 - skip MCP and expose the `HttpApi` as a CLI (`HttpApi.reflect` gives every
   endpoint as a command, with the API's auth).
+
+Effect-TS/effect#9026 asks for a request-scoped mode of `layerHttp`.
+
+## Safety net: the sync scheduler
+
+`new Scheduler.MixedScheduler("sync")` runs a fiber's next turn in a
+microtask instead of a timer, so no request takes it along when it ends.
+Provide it to the app's layer:
+
+```ts
+const SyncSchedulerLive = Layer.succeed(Scheduler.Scheduler, new Scheduler.MixedScheduler("sync"))
+const app = HttpRouter.toWebHandler(AppLive.pipe(Layer.provideMerge(SyncSchedulerLive)))
+```
+
+- It stops the scheduler hang: in the repro every scenario passes, and a busy
+  fiber runs about 13x faster (workerd's `setTimeout(0)` per yield is slow).
+- A CPU-heavy fiber no longer lets other requests on the isolate run between
+  its turns.
+- `Effect.sleep`, timeouts and schedules still use real timers, which still
+  die with their request: a long-lived fiber that sleeps hangs anyway.
+
+It is a safety net, not a reason to keep fibers alive. The rules above stay.
 
 ## Hangs must be visible
 
@@ -123,4 +154,5 @@ Search changed Effect code for these and check each against the rules above:
 ```sh
 rg -n 'runFork|forkDaemon|forkScoped|Effect\.cached|cachedWithTTL|Layer\.memoize|Queue\.|PubSub\.|Stream\.tick|Effect\.repeat|McpServer|RpcServer|createRemoteJWKSet' src
 rg -n '^(let|const) \w+\s*(:[^=]+)?=\s*(new Promise|.*\.then\()' src
+rg -n '\?\?=\s*(await\s+)?\(?\w+\(' src   # a lazily started build or fetch kept per isolate
 ```
